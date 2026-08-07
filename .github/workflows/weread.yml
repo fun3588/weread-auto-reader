@@ -3,7 +3,7 @@ name: 微信读书自动阅读
 on:
   schedule:
     # GitHub cron 使用 UTC 时间（北京时间 = UTC + 8）。
-    # 每小时整点运行一次，每次约 30 分钟（55 次 × 约 33 秒），全天 24 小时接力。
+    # 每小时整点运行一次，每次约 10 分钟（18 次 × 约 33 秒），全天 24 小时接力。
     - cron: "0 * * * *"
   workflow_dispatch: # 支持在 Actions 页面手动触发
 
@@ -16,8 +16,8 @@ concurrency:
 jobs:
   read:
     runs-on: ubuntu-latest
-    # 限制单次运行时长；Actions 单 job 硬上限为 360 分钟，预留缓冲
-    timeout-minutes: 45
+    # 限制单次运行时长；10 分钟阅读 + 环境启动缓冲
+    timeout-minutes: 20
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -39,7 +39,7 @@ jobs:
           HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
           HTTP_PROXY_BACKUP: ${{ secrets.HTTP_PROXY_BACKUP }}
           SERVERCHAN_SPT: ${{ secrets.SERVERCHAN_SPT }}
-          READ_NUM: ${{ vars.READ_NUM || 55 }}
+          READ_NUM: ${{ vars.READ_NUM || 18 }}
           BOOK_ID: ${{ vars.BOOK_ID || 'ce032b305a9bc1ce0b0dd2a' }}
         run: |
           set -e
