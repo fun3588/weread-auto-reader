@@ -28,8 +28,10 @@ Fork 本仓库后，进入 **Settings** -> **Secrets and variables** -> **Action
 | key | 说明 |
 | --- | --- |
 | `WXREAD_CURL_BASH` | **必填**，上一步抓包复制的 curl bash 命令全文 |
+| `WXREAD_CURL_BASH_BACKUP` | **可选**，第二个账号的 curl bash 命令全文。配置后主/备两账号**并行刷**；不配置则仅跑主账号（单线程） |
 | `SERVERCHAN_SPT` | **必填**，ServerChan 的 SendKey，[获取地址](https://sct.ftqq.com/sendkey) |
-| `HTTP_PROXY` | **可选**，HTTP 代理地址（如 `http://ip:port`）。当运行环境 IP 被微信读书风控（常见于 GitHub Action 节点）导致阅读失败时，可设置该值让请求走代理；留空则直连 |
+| `HTTP_PROXY` | **可选**，主账号 HTTP 代理地址（如 `http://ip:port`）。当运行环境 IP 被微信读书风控（常见于 GitHub Action 节点）导致阅读失败时，可设置该值让请求走代理；留空则直连 |
+| `HTTP_PROXY_BACKUP` | **可选**，备用账号的 HTTP 代理地址。建议两账号用不同代理，避免同一出口 IP 并行被判定关联账号 |
 
 **Variables** 中添加：
 

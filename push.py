@@ -1,4 +1,5 @@
 # push.py 推送模块，仅支持 ServerChan
+import os
 import json
 import logging
 import random
@@ -15,6 +16,9 @@ SERVERCHAN_URL = "https://sctapi.ftqq.com/{}.send"
 MAX_ATTEMPTS = 3
 REQUEST_TIMEOUT = 10
 
+# 账号标识（多账号并行时用于区分推送标题，未设置则保持原样）
+ACCOUNT_ID = os.getenv("ACCOUNT_ID", "")
+
 
 def push(content, is_success=True):
     """通过 ServerChan 推送消息，返回是否推送成功"""
@@ -22,7 +26,8 @@ def push(content, is_success=True):
         logger.warning("未配置 SERVERCHAN_SPT，跳过推送。")
         return False
 
-    title = f"微信读书自动阅读-{'成功' if is_success else '失败'}"
+    label = f"({ACCOUNT_ID})" if ACCOUNT_ID else ""
+    title = f"微信读书自动阅读{label}-{'成功' if is_success else '失败'}"
     url = SERVERCHAN_URL.format(SERVERCHAN_SPT)
     payload = json.dumps({"title": title, "desp": content}).encode("utf-8")
     headers = {"Content-Type": "application/json"}

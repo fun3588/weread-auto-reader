@@ -31,11 +31,37 @@ jobs:
       - name: 安装依赖
         run: pip install -r requirements.txt
 
+      # 主账号必填，备用账号可选：配置了 WXREAD_CURL_BASH_BACKUP 则两个账号并行，否则仅主账号
       - name: 运行阅读脚本
         env:
           WXREAD_CURL_BASH: ${{ secrets.WXREAD_CURL_BASH }}
-          SERVERCHAN_SPT: ${{ secrets.SERVERCHAN_SPT }}
+          WXREAD_CURL_BASH_BACKUP: ${{ secrets.WXREAD_CURL_BASH_BACKUP }}
           HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
+          HTTP_PROXY_BACKUP: ${{ secrets.HTTP_PROXY_BACKUP }}
+          SERVERCHAN_SPT: ${{ secrets.SERVERCHAN_SPT }}
           READ_NUM: ${{ vars.READ_NUM || 55 }}
           BOOK_ID: ${{ vars.BOOK_ID || 'ce032b305a9bc1ce0b0dd2a' }}
-        run: python main.py
+        run: |
+          set -e
+          pids=""
+
+          run_account() {
+            local curl_val="$1" proxy_val="$2" account_id="$3"
+            if [ -z "$curl_val" ]; then
+              echo "跳过账号 [$account_id]（未配置凭证）"
+              return 0
+            fi
+            echo "启动账号 [$account_id]"
+            WXREAD_CURL_BASH="$curl_val" HTTP_PROXY="$proxy_val" ACCOUNT_ID="$account_id" python main.py &
+            pids="$pids $!"
+          }
+
+          run_account "$WXREAD_CURL_BASH" "$HTTP_PROXY" "主账号"
+          run_account "$WXREAD_CURL_BASH_BACKUP" "$HTTP_PROXY_BACKUP" "备用"
+
+          # 等待所有并行账号完成；任一失败则退出非 0，标记运行失败
+          status=0
+          for pid in $pids; do
+            wait "$pid" || status=1
+          done
+          exit $status
