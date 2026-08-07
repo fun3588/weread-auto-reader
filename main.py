@@ -1,0 +1,310 @@
+# main.py 主逻辑：包括字段拼接、模拟请求
+import os
+import json
+import sys
+import time
+import random
+import logging
+import hashlib
+import urllib.parse
+
+# 凭证加载：与 collector.py 一致，环境变量 > 项目根目录 wxread_curl.txt
+# 必须在导入 config 之前完成，否则 config 会落到占位 cookies
+if not os.getenv("WXREAD_CURL_BASH"):
+    _curl_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wxread_curl.txt")
+    if os.path.exists(_curl_file):
+        with open(_curl_file, encoding="utf-8") as f:
+            os.environ["WXREAD_CURL_BASH"] = f.read().strip()
+
+import requests
+
+from push import push
+from log_utils import setup_logging, sanitize, mask
+from config import (
+    data,
+    headers,
+    cookies,
+    READ_NUM,
+    DEFAULT_BOOK_ID,
+    FALLBACK_CHAPTERS,
+    HTTP_PROXY,
+)
+
+# 加密盐及其它默认值
+KEY = "3c5c8717f3daf09iop3423zafeqoi"
+READ_URL = "https://weread.qq.com/web/book/read"
+RENEW_URL = "https://weread.qq.com/web/login/renewal"
+FIX_SYNCKEY_URL = "https://weread.qq.com/web/book/chapterInfos"
+COOKIE_DATA_VARIANTS = [
+    {"rq": "%2Fweb%2Fbook%2Fread", "ql": False},
+    {"rq": "%2Fweb%2Fbook%2Fread", "ql": True},
+    {"rq": "%2Fweb%2Fbook%2Fread"},
+]
+
+REQUEST_TIMEOUT = 15   # 单次请求超时（秒）
+MAX_FAIL_COUNT = 5     # 连续失败上限，超过则终止
+SLEEP_RANGE = (30, 35)  # 每次成功阅读后的随机等待区间（秒），保持 30 秒起的真人节奏
+CO_RANGE = (300, 700)   # 阅读页码随机范围，模拟真人翻页
+
+# 运行状态（供本地 WebUI 只读展示，严禁放入凭证类字段）
+RUNTIME_STATE = {
+    "round": 0,             # 挂机轮次（由本地挂机脚本写入）
+    "status": "idle",       # idle/reading/done/error
+    "read_num": READ_NUM,   # 本轮目标次数
+    "index": 0,             # 当前进度
+    "success_count": 0,     # 累计成功次数
+    "fail_count": 0,        # 当前连续失败次数
+    "last_result": "",      # 最近一次请求结果描述
+    "cookie_refreshed_at": "",
+    "started_at": "",
+    "finished_at": "",
+}
+
+
+def _now_str():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def encode_data(payload):
+    """数据编码"""
+    return '&'.join(
+        f"{k}={urllib.parse.quote(str(payload[k]), safe='')}" for k in sorted(payload.keys())
+    )
+
+
+def cal_hash(input_string):
+    """计算哈希值"""
+    _7032f5 = 0x15051505
+    _cc1055 = _7032f5
+    length = len(input_string)
+    _19094e = length - 1
+
+    while _19094e > 0:
+        _7032f5 = 0x7fffffff & (_7032f5 ^ ord(input_string[_19094e]) << (length - _19094e) % 30)
+        _cc1055 = 0x7fffffff & (_cc1055 ^ ord(input_string[_19094e - 1]) << _19094e % 30)
+        _19094e -= 2
+
+    return hex(_7032f5 + _cc1055)[2:].lower()
+
+
+def create_session():
+    """创建带鉴权信息的会话，后续响应的 Set-Cookie 会自动更新会话凭证"""
+    session = requests.Session()
+    session.headers.update(headers)
+    session.cookies.update(cookies)
+    if HTTP_PROXY:
+        session.proxies.update({"http": HTTP_PROXY, "https": HTTP_PROXY})
+    return session
+
+
+def get_wr_skey(session):
+    """刷新 cookie 密钥，成功返回新的 wr_skey，否则返回 None"""
+    for cookie_data in COOKIE_DATA_VARIANTS:
+        try:
+            response = session.post(
+                RENEW_URL,
+                data=json.dumps(cookie_data, separators=(',', ':')),
+                timeout=REQUEST_TIMEOUT,
+            )
+            if 'wr_skey' in response.cookies:
+                session.cookies.update(response.cookies)
+                return response.cookies['wr_skey']
+        except requests.RequestException as exc:
+            logging.warning("refresh_cookie 请求失败，原因：%s", sanitize(exc))
+    return None
+
+
+def refresh_cookie(session):
+    """刷新 cookie，失败时推送失败消息并终止运行"""
+    logging.info("刷新 cookie")
+    new_skey = get_wr_skey(session)
+    if new_skey:
+        cookies['wr_skey'] = new_skey
+        RUNTIME_STATE["cookie_refreshed_at"] = _now_str()
+        logging.info("密钥刷新成功，新密钥：%s", mask(new_skey))
+    else:
+        error_msg = "无法获取新密钥或者 WXREAD_CURL_BASH 配置有误，终止运行。"
+        RUNTIME_STATE["status"] = "error"
+        RUNTIME_STATE["last_result"] = error_msg
+        logging.error(error_msg)
+        push(error_msg, is_success=False)
+        raise SystemExit(error_msg)
+
+
+def fix_no_synckey(session):
+    """响应缺失 synckey 时，通过 chapterInfos 接口尝试修复"""
+    try:
+        response = session.post(
+            FIX_SYNCKEY_URL,
+            data=json.dumps({"bookIds": [DEFAULT_BOOK_ID]}, separators=(',', ':')),
+            timeout=REQUEST_TIMEOUT,
+        )
+        logging.info("synckey 修复请求返回：%s", response.status_code)
+    except requests.RequestException as exc:
+        logging.warning("synckey 修复请求失败：%s", sanitize(exc))
+
+
+def _extract_chapters(node):
+    """防御式解析：递归查找含 chapterId 的 dict 列表，提取章节信息"""
+    results = []
+    if isinstance(node, dict):
+        for value in node.values():
+            results.extend(_extract_chapters(value))
+    elif isinstance(node, list):
+        for item in node:
+            if isinstance(item, dict) and (
+                "chapterId" in item or "chapter_id" in item or "cid" in item
+            ):
+                chapter_id = item.get("chapterId") or item.get("chapter_id") or item.get("cid")
+                if not chapter_id:
+                    continue
+                results.append({
+                    "chapterId": chapter_id,
+                    "chapterIndex": item.get("chapterIndex", item.get("index")),
+                    "title": item.get("title", ""),
+                })
+            else:
+                results.extend(_extract_chapters(item))
+    return results
+
+
+def fetch_chapters(session, book_id):
+    """每次运行抓取一次书籍的真实章节列表，失败或解析为空时返回 None"""
+    try:
+        response = session.post(
+            FIX_SYNCKEY_URL,
+            data=json.dumps({"bookIds": [book_id]}, separators=(',', ':')),
+            timeout=REQUEST_TIMEOUT,
+        )
+        payload = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        logging.warning("章节列表抓取失败：%s", sanitize(exc))
+        return None
+
+    chapters = _extract_chapters(payload)
+    if not chapters:
+        logging.info("章节列表接口无增量数据（HTTP %s），使用回退章节。", response.status_code)
+        return None
+    logging.info("章节列表抓取成功（HTTP %s），共 %d 章。", response.status_code, len(chapters))
+    return chapters
+
+
+def build_data(last_time, chapters):
+    """构造一次阅读请求的 data 字段"""
+    data.pop('s', None)
+    data['b'] = DEFAULT_BOOK_ID
+    picked = random.choice(chapters)
+    if isinstance(picked, dict):
+        data['c'] = picked["chapterId"]
+        if picked.get("chapterIndex") is not None:
+            data['ci'] = picked["chapterIndex"]
+        if picked.get("title"):
+            data['sm'] = picked["title"]
+    else:
+        # 回退列表仅含 chapterId，ci/sm 保留模板默认值
+        data['c'] = picked
+    this_time = int(time.time())
+    data['co'] = random.randint(*CO_RANGE)
+    data['ct'] = this_time
+    data['rt'] = this_time - last_time
+    data['ts'] = int(this_time * 1000) + random.randint(0, 1000)
+    data['rn'] = random.randint(0, 1000)
+    data['sg'] = hashlib.sha256(f"{data['ts']}{data['rn']}{KEY}".encode()).hexdigest()
+    data['s'] = cal_hash(encode_data(data))
+    return this_time
+
+
+def send_read_request(session):
+    """发送一次阅读请求，返回解析后的响应 dict，网络/解析异常返回 None"""
+    try:
+        response = session.post(
+            READ_URL,
+            data=json.dumps(data, separators=(',', ':')),
+            timeout=REQUEST_TIMEOUT,
+        )
+        res_data = response.json()
+        if not res_data or not res_data.get('succ'):
+            logging.warning("read 响应异常：HTTP %s，body=%s", response.status_code, sanitize(res_data))
+        return res_data
+    except (requests.RequestException, ValueError) as exc:
+        logging.warning("阅读请求失败：%s", sanitize(exc))
+        return None
+
+
+def main():
+    refresh_print = setup_logging()
+
+    session = create_session()
+    refresh_cookie(session)
+
+    # 每次运行抓取一次章节列表，失败则回退兜底章节
+    chapters = fetch_chapters(session, DEFAULT_BOOK_ID) or FALLBACK_CHAPTERS
+
+    index = 1
+    fail_count = 0
+    last_time = int(time.time()) - 30
+    RUNTIME_STATE.update({
+        "status": "reading",
+        "read_num": READ_NUM,
+        "index": 1,
+        "success_count": 0,
+        "fail_count": 0,
+        "last_result": "",
+        "started_at": _now_str(),
+        "finished_at": "",
+    })
+    logging.info("一共需要阅读 %d 次。", READ_NUM)
+
+    while index <= READ_NUM:
+        this_time = build_data(last_time, chapters)
+
+        refresh_print(f"阅读进度: 第 {index}/{READ_NUM} 次，已完成 {(index - 1) * 0.5:.1f} 分钟")
+        res_data = send_read_request(session)
+
+        if res_data is None:
+            # 网络异常或非 JSON 响应，计入失败次数
+            fail_count += 1
+            RUNTIME_STATE["last_result"] = "请求失败（网络/解析异常）"
+        elif res_data.get('succ'):
+            if 'synckey' in res_data:
+                fail_count = 0
+                last_time = this_time
+                index += 1
+                RUNTIME_STATE["success_count"] += 1
+                RUNTIME_STATE["last_result"] = "成功，synckey 已返回"
+                time.sleep(random.randint(*SLEEP_RANGE))
+                refresh_print(
+                    f"阅读进度: 第 {min(index, READ_NUM + 1) - 1}/{READ_NUM} 次，"
+                    f"已完成 {(index - 1) * 0.5:.1f} 分钟"
+                )
+                continue
+            logging.warning("无 synckey，尝试修复...")
+            fix_no_synckey(session)
+            fail_count += 1
+            RUNTIME_STATE["last_result"] = "无 synckey，已尝试修复"
+        else:
+            logging.warning("read 返回失败，尝试刷新 cookie...")
+            refresh_cookie(session)
+            fail_count += 1
+            RUNTIME_STATE["last_result"] = "cookie 过期，已刷新重试"
+
+        RUNTIME_STATE["index"] = index
+        RUNTIME_STATE["fail_count"] = fail_count
+
+        if fail_count >= MAX_FAIL_COUNT:
+            error_msg = f"连续失败 {fail_count} 次，终止运行。"
+            RUNTIME_STATE["status"] = "error"
+            RUNTIME_STATE["last_result"] = error_msg
+            logging.error(error_msg)
+            push(error_msg, is_success=False)
+            sys.exit(1)
+        time.sleep(random.randint(5, 10))
+
+    RUNTIME_STATE["status"] = "done"
+    RUNTIME_STATE["finished_at"] = _now_str()
+    logging.info("阅读脚本已完成。")
+    push(f"微信读书自动阅读完成。\n阅读时长：{READ_NUM * 0.5:.1f} 分钟。", is_success=True)
+
+
+if __name__ == "__main__":
+    main()

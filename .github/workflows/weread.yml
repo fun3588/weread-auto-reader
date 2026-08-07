@@ -1,0 +1,41 @@
+name: 微信读书自动阅读
+
+on:
+  schedule:
+    # GitHub cron 使用 UTC 时间（北京时间 = UTC + 8）。
+    # 每小时整点运行一次，每次约 30 分钟（55 次 × 约 33 秒），全天 24 小时接力。
+    - cron: "0 * * * *"
+  workflow_dispatch: # 支持在 Actions 页面手动触发
+
+# 同一时间只允许一次运行；上一窗口未结束时新触发的运行排队等待，
+# 而不是直接取消，避免丢失阅读进度
+concurrency:
+  group: weread-reader
+  cancel-in-progress: false
+
+jobs:
+  read:
+    runs-on: ubuntu-latest
+    # 限制单次运行时长；Actions 单 job 硬上限为 360 分钟，预留缓冲
+    timeout-minutes: 45
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 运行阅读脚本
+        env:
+          WXREAD_CURL_BASH: ${{ secrets.WXREAD_CURL_BASH }}
+          SERVERCHAN_SPT: ${{ secrets.SERVERCHAN_SPT }}
+          HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
+          READ_NUM: ${{ vars.READ_NUM || 55 }}
+          BOOK_ID: ${{ vars.BOOK_ID || 'ce032b305a9bc1ce0b0dd2a' }}
+        run: python main.py

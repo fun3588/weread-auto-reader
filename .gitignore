@@ -1,0 +1,21 @@
+# 敏感文件：抓包数据与生成的 curl 命令含真实 cookie，严禁提交
+wxread_curl.txt
+weread-*.json
+
+# Python
+__pycache__/
+*.pyc
+
+# v2 榜单书库采集产物（不入库，控制仓库体积）
+v2/data/
+
+# 本地测试临时文件（下划线开头均为探针/输出/日志，不入库）
+localTest/_*
+localTest/node_modules/
+
+# 其他工具的临时产物
+.qoder/
+test_parse*.py
+
+# IDE
+.idea/
