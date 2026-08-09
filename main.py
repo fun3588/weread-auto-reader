@@ -213,8 +213,9 @@ def extract_state(html):
 
 
 def fetch_reader_session(session, url_book_id):
-    """抓取阅读页，获取数字 bookId / psvts / token 作为动态签名会话。
-    返回 (book_id_num, psvts, token)，失败返回 None。"""
+    """抓取阅读页，获取数字 bookId / psvts / token 与完整章节列表。
+    返回 (book_id_num, psvts, token, chapters)，失败返回 None。
+    chapters: 每项含 chapterUid/chapterIdx/title，用于构造 c/ci/sm 完全匹配的请求。"""
     try:
         response = session.get(f"{READER_URL}/{url_book_id}", timeout=REQUEST_TIMEOUT)
         state = extract_state(response.text)
@@ -231,7 +232,21 @@ def fetch_reader_session(session, url_book_id):
     if not book_id_num or not psvts:
         logging.warning("阅读页 %s 缺少 bookId/psvts。", url_book_id)
         return None
-    return str(book_id_num), psvts, token
+    chapters = []
+    for ch in (reader.get("chapterInfos") or []):
+        uid = ch.get("chapterUid")
+        if uid is None:
+            continue
+        chapters.append({
+            "chapterUid": uid,
+            "chapterIdx": ch.get("chapterIdx", ch.get("index", 0)),
+            "title": ch.get("title", ""),
+        })
+    if not chapters:
+        logging.warning("阅读页 %s 未提取到章节列表，使用回退章节。", url_book_id)
+    else:
+        logging.info("阅读页章节列表 %d 章。", len(chapters))
+    return str(book_id_num), psvts, token, chapters
 
 
 def fetch_chapters(session, book_id):
@@ -257,18 +272,24 @@ def fetch_chapters(session, book_id):
 
 def build_data(last_time, chapters, session_info):
     """构造一次阅读请求的 data 字段（动态会话签名）。
-    session_info: (book_id_num, psvts, token)，来自阅读页动态获取。"""
-    book_id_num, psvts, token = session_info
+    session_info: (book_id_num, psvts, token, chapters)，来自阅读页动态获取。"""
+    book_id_num, psvts, token, _ = session_info
     this_time = int(time.time())
     data["b"] = idgen.e(book_id_num)
     picked = random.choice(chapters)
     if isinstance(picked, dict):
-        data["c"] = picked["chapterId"]
-        if picked.get("chapterIndex") is not None:
+        if picked.get("chapterUid") is not None:
+            data["c"] = idgen.e(picked["chapterUid"])
+        else:
+            data["c"] = picked["chapterId"]
+        if picked.get("chapterIdx") is not None:
+            data["ci"] = picked["chapterIdx"]
+        elif picked.get("chapterIndex") is not None:
             data["ci"] = picked["chapterIndex"]
         if picked.get("title"):
             data["sm"] = picked["title"]
     else:
+        # 回退列表仅含 chapterId，ci 保持模板默认（可能不匹配，慎用）
         data["c"] = picked
     data["co"] = random.randint(*CO_RANGE)
     data["ct"] = this_time
@@ -278,6 +299,8 @@ def build_data(last_time, chapters, session_info):
     data["ps"] = psvts
     data["pc"] = idgen.e(str(int(time.time())))
     data["sg"] = hashlib.sha256(f"{data['ts']}{data['rn']}{token}".encode()).hexdigest()
+    # 先移除旧 s，避免上一轮残留值污染本次签名
+    data.pop("s", None)
     data["s"] = cal_hash(encode_data(data))
     return this_time
 
@@ -305,12 +328,14 @@ def main():
     session = create_session()
     refresh_cookie(session)
 
-    # 每次运行抓取一次阅读页会话（动态 psvts/token）与章节列表
+    # 每次运行从阅读页获取动态会话（psvts/token）与完整章节列表
     session_info = fetch_reader_session(session, DEFAULT_BOOK_ID)
     if not session_info:
         logging.error("无法获取阅读页会话，终止运行。")
         sys.exit(1)
-    chapters = fetch_chapters(session, DEFAULT_BOOK_ID) or FALLBACK_CHAPTERS
+    book_id_num, psvts, token, reader_chapters = session_info
+    # 优先用阅读页章节（c/ci/sm 完全匹配），否则动态抓取，最后回退
+    chapters = reader_chapters or (fetch_chapters(session, DEFAULT_BOOK_ID) or FALLBACK_CHAPTERS)
 
     index = 1
     fail_count = 0
