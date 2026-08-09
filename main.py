@@ -50,6 +50,7 @@ REQUEST_TIMEOUT = 15   # 单次请求超时（秒）
 MAX_FAIL_COUNT = 5     # 连续失败上限，超过则终止
 SLEEP_RANGE = (30, 35)  # 每次成功阅读后的随机等待区间（秒），保持 30 秒起的真人节奏
 CO_RANGE = (300, 700)   # 阅读页码随机范围，模拟真人翻页
+SESSION_REFRESH_EVERY = 6  # 每成功 N 次重新获取阅读页会话（psvts 有效期约几分钟）
 
 # 运行状态（供本地 WebUI 只读展示，严禁放入凭证类字段）
 RUNTIME_STATE = {
@@ -353,6 +354,15 @@ def main():
     logging.info("一共需要阅读 %d 次。", READ_NUM)
 
     while index <= READ_NUM:
+        # 定期重新获取阅读页会话，避免 psvts 过期导致签名失败
+        if index > 1 and (index - 1) % SESSION_REFRESH_EVERY == 0:
+            refreshed = fetch_reader_session(session, DEFAULT_BOOK_ID)
+            if refreshed:
+                session_info = refreshed
+                logging.info("已刷新阅读页会话（第 %d 次）。", index)
+            else:
+                logging.warning("刷新阅读页会话失败，继续用旧会话。")
+
         this_time = build_data(last_time, chapters, session_info)
 
         refresh_print(f"阅读进度: 第 {index}/{READ_NUM} 次，已完成 {(index - 1) * 0.5:.1f} 分钟")
@@ -380,10 +390,15 @@ def main():
             fail_count += 1
             RUNTIME_STATE["last_result"] = "无 synckey，已尝试修复"
         else:
-            logging.warning("read 返回失败，尝试刷新 cookie...")
+            logging.warning("read 返回失败，尝试刷新会话与 cookie...")
+            # psvts/token 过期是主要失败原因，先重新获取阅读页会话
+            refreshed = fetch_reader_session(session, DEFAULT_BOOK_ID)
+            if refreshed:
+                session_info = refreshed
+                logging.info("阅读页会话已刷新。")
             refresh_cookie(session)
             fail_count += 1
-            RUNTIME_STATE["last_result"] = "cookie 过期，已刷新重试"
+            RUNTIME_STATE["last_result"] = "会话过期，已刷新重试"
 
         RUNTIME_STATE["index"] = index
         RUNTIME_STATE["fail_count"] = fail_count
