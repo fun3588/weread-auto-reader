@@ -42,6 +42,10 @@ HTTP_PROXY = os.getenv("HTTP_PROXY", "")
 
 
 # read 接口的 curl bash 命令（GitHub Actions 中配置为 secret）
+# 支持两种格式：
+#   1. 完整 curl：含 -H / -b / --data-raw 的 curl 命令（推荐，可自动提取 data）
+#   2. 纯 Cookie：形如 "wr_skey=xxx; wr_vid=xxx; ..." 的 cookie 字符串
+#      （此时 data 使用下方模板默认值，appId/ps/pc 需为有效值）
 curl_str = os.getenv("WXREAD_CURL_BASH", "")
 
 # 本地部署时的兜底 headers / cookies 占位，
@@ -156,14 +160,51 @@ def parse_data_from_curl(curl_command):
     return {key: payload[key] for key in data if key in payload}
 
 
+def parse_cookie_str(cookie_str):
+    """解析纯 cookie 字符串（"k1=v1; k2=v2"）为字典"""
+    parsed = {}
+    for item in cookie_str.split(";"):
+        item = item.strip()
+        if "=" in item:
+            key, value = item.split("=", 1)
+            parsed[key.strip()] = value.strip()
+    return parsed
+
+
+def is_curl_command(text):
+    """判断输入是否为 curl 命令格式（含 -H 或 curl 前缀）"""
+    return bool(re.search(r"curl\s+'|-\s*H\s+['\"]|--data-raw", text))
+
+
 if curl_str:
-    headers, cookies = convert(curl_str)
+    if is_curl_command(curl_str):
+        headers, cookies = convert(curl_str)
+        data.update(parse_data_from_curl(curl_str))
+    else:
+        # 纯 cookie 字符串：data 用模板值，cookie 直接解析
+        parsed = parse_cookie_str(curl_str)
+        if parsed:
+            cookies = parsed
+            # 纯 cookie 模式缺少 appId/ps/pc 等字段，可通过 WXREAD_DATA_JSON 补充
+            data_json = os.getenv("WXREAD_DATA_JSON", "")
+            if data_json:
+                try:
+                    data.update({k: v for k, v in json.loads(data_json).items() if k in data})
+                except (ValueError, TypeError):
+                    logger.warning("WXREAD_DATA_JSON 不是合法 JSON，已忽略。")
+            missing = [k for k in ("appId", "ps", "pc") if not data.get(k)]
+            if missing:
+                logger.warning(
+                    "使用纯 Cookie 模式，data 缺失字段 %s（模板为占位符），"
+                    "建议改用完整 curl 或设置 WXREAD_DATA_JSON。",
+                    missing,
+                )
     if not cookies or "wr_skey" not in cookies:
         raise ValueError(
             "WXREAD_CURL_BASH 解析失败或未包含 wr_skey，"
-            "请确认抓包内容完整且来自 read 接口的『复制为 cURL (Bash)』。"
+            "请确认抓包内容完整且来自 read 接口的『复制为 cURL (Bash)』"
+            "或为包含 wr_skey 的 Cookie 字符串。"
         )
-    data.update(parse_data_from_curl(curl_str))
 elif cookies.get("wr_skey", "").startswith("YOUR_"):
     logger.warning("未配置 WXREAD_CURL_BASH 且 config.py 中仍是占位 cookies，请完成配置后再运行。")
 
