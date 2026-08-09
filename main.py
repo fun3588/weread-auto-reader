@@ -30,11 +30,16 @@ from config import (
     HTTP_PROXY,
 )
 
+import sys as _sys
+_v2_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "v2")
+if _v2_dir not in _sys.path:
+    _sys.path.insert(0, _v2_dir)
+import idgen
+
 # 加密盐及其它默认值
-KEY = "3c5c8717f3daf09iop3423zafeqoi"
 READ_URL = "https://weread.qq.com/web/book/read"
 RENEW_URL = "https://weread.qq.com/web/login/renewal"
-FIX_SYNCKEY_URL = "https://weread.qq.com/web/book/chapterInfos"
+READER_URL = "https://weread.qq.com/web/reader"
 COOKIE_DATA_VARIANTS = [
     {"rq": "%2Fweb%2Fbook%2Fread", "ql": False},
     {"rq": "%2Fweb%2Fbook%2Fread", "ql": True},
@@ -107,6 +112,10 @@ def get_wr_skey(session):
                 timeout=REQUEST_TIMEOUT,
             )
             if 'wr_skey' in response.cookies:
+                # 先清除旧 wr_skey，避免 session 中多值冲突导致发送时用错 key
+                for c in list(session.cookies):
+                    if c.name == 'wr_skey':
+                        session.cookies.clear(c.domain, c.path, c.name)
                 session.cookies.update(response.cookies)
                 return response.cookies['wr_skey']
         except requests.RequestException as exc:
@@ -135,7 +144,7 @@ def fix_no_synckey(session):
     """响应缺失 synckey 时，通过 chapterInfos 接口尝试修复"""
     try:
         response = session.post(
-            FIX_SYNCKEY_URL,
+            "https://weread.qq.com/web/book/chapterInfos",
             data=json.dumps({"bookIds": [DEFAULT_BOOK_ID]}, separators=(',', ':')),
             timeout=REQUEST_TIMEOUT,
         )
@@ -168,11 +177,68 @@ def _extract_chapters(node):
     return results
 
 
+def extract_state(html):
+    """平衡括号提取 window.__INITIAL_STATE__ 后的 JSON 对象。解析失败返回 None。"""
+    idx = html.find("window.__INITIAL_STATE__")
+    if idx < 0:
+        return None
+    start = html.find("{", html.find("=", idx))
+    if start < 0:
+        return None
+    depth, i, in_str, esc = 0, start, False, False
+    length = len(html)
+    while i < length:
+        ch = html[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(html[start:i + 1])
+                    except ValueError:
+                        return None
+        i += 1
+    return None
+
+
+def fetch_reader_session(session, url_book_id):
+    """抓取阅读页，获取数字 bookId / psvts / token 作为动态签名会话。
+    返回 (book_id_num, psvts, token)，失败返回 None。"""
+    try:
+        response = session.get(f"{READER_URL}/{url_book_id}", timeout=REQUEST_TIMEOUT)
+        state = extract_state(response.text)
+    except requests.RequestException as exc:
+        logging.warning("阅读页 %s 请求失败：%s", url_book_id, sanitize(exc))
+        return None
+    if not state:
+        logging.warning("阅读页 %s 未提取到内嵌数据。", url_book_id)
+        return None
+    reader = state.get("reader", {})
+    book_id_num = reader.get("bookId")
+    psvts = reader.get("psvts")
+    token = reader.get("token", "")
+    if not book_id_num or not psvts:
+        logging.warning("阅读页 %s 缺少 bookId/psvts。", url_book_id)
+        return None
+    return str(book_id_num), psvts, token
+
+
 def fetch_chapters(session, book_id):
     """每次运行抓取一次书籍的真实章节列表，失败或解析为空时返回 None"""
     try:
         response = session.post(
-            FIX_SYNCKEY_URL,
+            "https://weread.qq.com/web/book/chapterInfos",
             data=json.dumps({"bookIds": [book_id]}, separators=(',', ':')),
             timeout=REQUEST_TIMEOUT,
         )
@@ -189,28 +255,30 @@ def fetch_chapters(session, book_id):
     return chapters
 
 
-def build_data(last_time, chapters):
-    """构造一次阅读请求的 data 字段"""
-    data.pop('s', None)
-    data['b'] = DEFAULT_BOOK_ID
+def build_data(last_time, chapters, session_info):
+    """构造一次阅读请求的 data 字段（动态会话签名）。
+    session_info: (book_id_num, psvts, token)，来自阅读页动态获取。"""
+    book_id_num, psvts, token = session_info
+    this_time = int(time.time())
+    data["b"] = idgen.e(book_id_num)
     picked = random.choice(chapters)
     if isinstance(picked, dict):
-        data['c'] = picked["chapterId"]
+        data["c"] = picked["chapterId"]
         if picked.get("chapterIndex") is not None:
-            data['ci'] = picked["chapterIndex"]
+            data["ci"] = picked["chapterIndex"]
         if picked.get("title"):
-            data['sm'] = picked["title"]
+            data["sm"] = picked["title"]
     else:
-        # 回退列表仅含 chapterId，ci/sm 保留模板默认值
-        data['c'] = picked
-    this_time = int(time.time())
-    data['co'] = random.randint(*CO_RANGE)
-    data['ct'] = this_time
-    data['rt'] = this_time - last_time
-    data['ts'] = int(this_time * 1000) + random.randint(0, 1000)
-    data['rn'] = random.randint(0, 1000)
-    data['sg'] = hashlib.sha256(f"{data['ts']}{data['rn']}{KEY}".encode()).hexdigest()
-    data['s'] = cal_hash(encode_data(data))
+        data["c"] = picked
+    data["co"] = random.randint(*CO_RANGE)
+    data["ct"] = this_time
+    data["rt"] = this_time - last_time
+    data["ts"] = int(this_time * 1000) + random.randint(0, 1000)
+    data["rn"] = random.randint(0, 1000)
+    data["ps"] = psvts
+    data["pc"] = idgen.e(str(int(time.time())))
+    data["sg"] = hashlib.sha256(f"{data['ts']}{data['rn']}{token}".encode()).hexdigest()
+    data["s"] = cal_hash(encode_data(data))
     return this_time
 
 
@@ -237,7 +305,11 @@ def main():
     session = create_session()
     refresh_cookie(session)
 
-    # 每次运行抓取一次章节列表，失败则回退兜底章节
+    # 每次运行抓取一次阅读页会话（动态 psvts/token）与章节列表
+    session_info = fetch_reader_session(session, DEFAULT_BOOK_ID)
+    if not session_info:
+        logging.error("无法获取阅读页会话，终止运行。")
+        sys.exit(1)
     chapters = fetch_chapters(session, DEFAULT_BOOK_ID) or FALLBACK_CHAPTERS
 
     index = 1
@@ -256,7 +328,7 @@ def main():
     logging.info("一共需要阅读 %d 次。", READ_NUM)
 
     while index <= READ_NUM:
-        this_time = build_data(last_time, chapters)
+        this_time = build_data(last_time, chapters, session_info)
 
         refresh_print(f"阅读进度: 第 {index}/{READ_NUM} 次，已完成 {(index - 1) * 0.5:.1f} 分钟")
         res_data = send_read_request(session)

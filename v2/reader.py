@@ -1,7 +1,15 @@
 # reader.py 真实阅读刷榜：从书库中按榜单图书逐章发送 read 请求，走代理
 #
 # 与干跑 runner.py 不同，本脚本发送真实的 /web/book/read 请求（计入阅读时长）。
-# 依赖破解的 chapterId 算法（idgen.e(chapterUid)），鉴权复用根目录凭证。
+# 依赖破解的加密算法（idgen.e()），鉴权复用根目录凭证。
+#
+# 计入时长的关键（2026-08-08 逆向验证，readingTime 实测 +60 秒）：
+# - b = e(数字 bookId)，数字 bookId 从阅读页 INITIAL_STATE 获取
+# - c = e(chapterUid)
+# - ps = 阅读页返回的 psvts（动态会话标识，每次阅读会话不同，不能硬编码）
+# - pc = e(客户端时间戳)
+# - sg = sha256(ts+rn+token)，token 从阅读页获取（非固定 KEY）
+# - rt = 距 startReadingTime 的累计秒数
 #
 # 用法：
 #   python v2/reader.py --minutes 5                  # 从书库随机挑书刷 5 分钟
@@ -35,7 +43,7 @@ if not os.getenv("WXREAD_CURL_BASH"):
 
 import requests
 from log_utils import setup_logging, sanitize, mask
-from config import data, headers, cookies, HTTP_PROXY, FALLBACK_CHAPTERS
+from config import headers, cookies, HTTP_PROXY
 import library
 import pace
 import idgen
@@ -44,20 +52,16 @@ logger = logging.getLogger(__name__)
 
 READ_URL = "https://weread.qq.com/web/book/read"
 RENEW_URL = "https://weread.qq.com/web/login/renewal"
-KEY = "3c5c8717f3daf09iop3423zafeqoi"
+READER_URL = "https://weread.qq.com/web/reader"
 
 REQUEST_TIMEOUT = 15
 MAX_FAIL_COUNT = 5
-SLEEP_RANGE = (8, 15)   # 每次成功阅读后的等待（秒），比 main.py 略短便于测试
+SLEEP_RANGE = (8, 15)   # 每次成功阅读后的等待（秒）
 COOKIE_DATA_VARIANTS = [
     {"rq": "%2Fweb%2Fbook%2Fread", "ql": False},
     {"rq": "%2Fweb%2Fbook%2Fread", "ql": True},
     {"rq": "%2Fweb%2Fbook%2Fread"},
 ]
-
-# ps/pc 为抓包固定的阅读上下文参数（与 main.py 一致）
-PS = "fc732b007aa56428g01604c"
-PC = "7a432b507aa56430g01640c"
 
 CHARS_PER_PAGE = 300
 
@@ -91,7 +95,7 @@ def cal_hash(input_string):
 
 
 def refresh_cookie(session):
-    """刷新 wr_skey，成功返回 True"""
+    """刷新 wr_skey，成功返回 True。刷新前清除旧 wr_skey，避免多值冲突。"""
     for cookie_data in COOKIE_DATA_VARIANTS:
         try:
             response = session.post(
@@ -100,6 +104,9 @@ def refresh_cookie(session):
                 timeout=REQUEST_TIMEOUT,
             )
             if 'wr_skey' in response.cookies:
+                for c in list(session.cookies):
+                    if c.name == 'wr_skey':
+                        session.cookies.clear(c.domain, c.path, c.name)
                 session.cookies.update(response.cookies)
                 return True
         except requests.RequestException as exc:
@@ -107,28 +114,92 @@ def refresh_cookie(session):
     return False
 
 
-def build_data(book, chapter, last_time):
-    """构造一次阅读请求。chapter 为书库章节条目（含 chapterUid/chapterIdx）"""
+def extract_state(html):
+    """平衡括号提取 window.__INITIAL_STATE__ 后的 JSON 对象。解析失败返回 None。"""
+    idx = html.find("window.__INITIAL_STATE__")
+    if idx < 0:
+        return None
+    start = html.find("{", html.find("=", idx))
+    if start < 0:
+        return None
+    depth, i, in_str, esc = 0, start, False, False
+    length = len(html)
+    while i < length:
+        ch = html[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(html[start:i + 1])
+                    except ValueError:
+                        return None
+        i += 1
+    return None
+
+
+def fetch_reader_session(session, url_book_id):
+    """抓取阅读页，获取数字 bookId / psvts / token / 当前章节。
+    返回 (book_id_num, psvts, token, current_chapter)，失败返回 None。"""
+    url = f"{READER_URL}/{url_book_id}"
+    try:
+        response = session.get(url, timeout=REQUEST_TIMEOUT)
+        state = extract_state(response.text)
+    except requests.RequestException as exc:
+        logger.warning("阅读页 %s 请求失败：%s", url_book_id, sanitize(exc))
+        return None
+    if not state:
+        logger.warning("阅读页 %s 未提取到内嵌数据。", url_book_id)
+        return None
+    reader = state.get("reader", {})
+    book_id_num = reader.get("bookId")
+    psvts = reader.get("psvts")
+    token = reader.get("token", "")
+    current_ch = reader.get("currentChapter", {}) or {}
+    if not book_id_num or not psvts:
+        logger.warning("阅读页 %s 缺少 bookId/psvts。", url_book_id)
+        return None
+    return str(book_id_num), psvts, token, current_ch
+
+
+def build_data(book_id_hashed, chapter, session_info, rt):
+    """构造一次阅读请求。
+    book_id_hashed: 哈希 bookId（e(数字bookId)）
+    chapter: 书库章节条目
+    session_info: (book_id_num, psvts, token, ...) 阅读会话
+    rt: 本次阅读时长（秒）
+    返回 (payload, this_time)。"""
+    book_id_num, psvts, token, _ = session_info
+    this_time = int(time.time())
     payload = {
         "appId": "wb182564874663h571399877",
-        "b": book["bookId"],
+        "b": book_id_hashed,
         "c": idgen.e(chapter["chapterUid"]),
         "ci": chapter.get("chapterIdx") or 0,
-        "co": random.randint(0, 800),
+        "co": random.randint(300, 700),
         "sm": chapter.get("title", ""),
         "pr": 0,
-        "rt": pace.PAGE_SECONDS,
-        "ps": PS,
-        "pc": PC,
+        "rt": rt,
+        "ts": int(this_time * 1000) + random.randint(0, 1000),
+        "rn": random.randint(0, 1000),
+        "ct": this_time,
+        "ps": psvts,
+        "pc": idgen.e(str(int(time.time()))),
     }
-    this_time = int(time.time())
-    payload['ct'] = this_time
-    payload['rt'] = this_time - last_time
-    payload['ts'] = int(this_time * 1000) + random.randint(0, 1000)
-    payload['rn'] = random.randint(0, 1000)
-    payload['sg'] = hashlib.sha256(f"{payload['ts']}{payload['rn']}{KEY}".encode()).hexdigest()
-    payload['s'] = cal_hash(encode_data(payload))
-    return this_time
+    payload["sg"] = hashlib.sha256(f"{payload['ts']}{payload['rn']}{token}".encode()).hexdigest()
+    payload["s"] = cal_hash(encode_data(payload))
+    return payload, this_time
 
 
 def send_read(session, payload):
@@ -151,19 +222,28 @@ def pages_of(chapter):
 
 
 def read_book(session, book, minutes, dry_run):
-    """对一本书按节奏逐章发送阅读请求。返回成功次数。"""
+    """对一本书按节奏逐章发送阅读请求。返回成功次数。
+    每本书先抓阅读页获取动态会话（psvts/token/bookId），再逐章上报。"""
     chapters = book.get("chapters", [])
     if not chapters:
         logger.warning("《%s》无章节数据，跳过。", book.get("title", ""))
         return 0
 
+    url_book_id = book.get("bookId", "")
+    session_info = fetch_reader_session(session, url_book_id)
+    if not session_info:
+        logger.error("《%s》获取阅读会话失败，跳过。", book.get("title", ""))
+        return 0
+    book_id_num, psvts, token, _ = session_info
+    book_id_hashed = idgen.e(book_id_num)
+    logger.info("《%s》 bookId=%s 数字id=%s", book.get("title", ""), url_book_id, book_id_num)
+
     budget = int(minutes * 60)
     elapsed = 0
     success = 0
-    last_time = int(time.time()) - 60
     fail_count = 0
 
-    logger.info("开始阅读《%s》 bookId=%s（%d 分钟）", book.get("title", ""), book.get("bookId", ""), minutes)
+    logger.info("开始阅读《%s》（%d 分钟）", book.get("title", ""), minutes)
     for chapter in chapters:
         if elapsed >= budget:
             break
@@ -179,14 +259,13 @@ def read_book(session, book, minutes, dry_run):
             success += 1
             continue
 
-        this_time = build_data(book, chapter, last_time)
-        res = send_read(session, this_time)
+        payload, _ = build_data(book_id_hashed, chapter, session_info, chapter_seconds)
+        res = send_read(session, payload)
         if res is None:
             fail_count += 1
         elif res.get('succ'):
             fail_count = 0
             success += 1
-            last_time = this_time
             elapsed += chapter_seconds
             time.sleep(random.randint(*SLEEP_RANGE))
         else:

@@ -1,0 +1,68 @@
+name: 微信读书真实浏览器刷读
+
+# 用 playwright 驱动真实 Chromium 打开阅读页，模拟真人翻页，阅读时长精确计入
+# （接口直发 read 请求会被风控忽略，真实浏览器行为 100% 计入）。
+# 每轮：固定刷主书（BOOK_ID）几分钟 + 随机刷榜单书（RANDOM_BOOKS 本）。
+
+on:
+  schedule:
+    # GitHub cron 使用 UTC 时间（北京时间 = UTC + 8）。
+    # 每小时 15/45 分各运行一次（每 30 分钟接力），每次约 12 分钟。
+    - cron: "15,45 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: weread-autopage
+  cancel-in-progress: false
+
+jobs:
+  autopage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 安装 Python 依赖
+        run: pip install -r requirements.txt
+
+      - name: 安装 Chromium（含系统依赖）
+        run: |
+          python -m playwright install --with-deps chromium
+        env:
+          # 加速下载（可选）
+          PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT: 120000
+
+      - name: 采集最新榜单书库
+        env:
+          WXREAD_CURL_BASH: ${{ secrets.WXREAD_CURL_BASH }}
+          HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
+        run: |
+          python v2/collector.py --ranks rising,all,hot_search,newbook --top 5 --chapters
+
+      - name: 运行真实浏览器刷读
+        env:
+          WXREAD_CURL_BASH: ${{ secrets.WXREAD_CURL_BASH }}
+          HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
+          SERVERCHAN_SPT: ${{ secrets.SERVERCHAN_SPT }}
+          BOOK_ID: ${{ vars.BOOK_ID || 'ce032b305a9bc1ce0b0dd2a' }}
+          MAIN_MINUTES: ${{ vars.MAIN_MINUTES || 8 }}
+          RANDOM_BOOKS: ${{ vars.RANDOM_BOOKS || 2 }}
+          RANDOM_MINUTES: ${{ vars.RANDOM_MINUTES || 3 }}
+          READ_INTERVAL: ${{ vars.READ_INTERVAL || 5 }}
+        run: |
+          set -e
+          python v2/autopage.py \
+            --main-book "$BOOK_ID" \
+            --random-books "$RANDOM_BOOKS" \
+            --main-minutes "$MAIN_MINUTES" \
+            --minutes "$RANDOM_MINUTES" \
+            --interval "$READ_INTERVAL" \
+            --rounds 1 \
+            --headless

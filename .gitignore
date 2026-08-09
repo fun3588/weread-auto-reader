@@ -19,3 +19,5 @@ test_parse*.py
 
 # IDE
 .idea/
+
+v2/autopage*.log
