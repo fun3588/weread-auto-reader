@@ -52,8 +52,16 @@ SLEEP_RANGE = (30, 35)  # 每次成功阅读后的随机等待区间（秒），
 CO_RANGE = (300, 700)   # 阅读页码随机范围，模拟真人翻页
 SESSION_REFRESH_EVERY = 6  # 每成功 N 次重新获取阅读页会话（psvts 有效期约几分钟）
 
+# 随机书阅读：主书读完后，从书库随机挑 RANDOM_BOOKS 本，每本读 RANDOM_BOOK_READS 次，
+# 确保榜单新书也有阅读记录计入时长
+RANDOM_BOOKS = int(os.getenv("RANDOM_BOOKS", "10"))
+RANDOM_BOOK_READS = int(os.getenv("RANDOM_BOOK_READS", "3"))
+
 # 代理不可达时置为 True，后续所有请求自动改直连
 _PROXY_FAILED = False
+
+# 进度条刷新函数（由 setup_logging 返回，模块级供各函数使用）
+refresh_print = lambda message: None
 
 # 运行状态（供本地 WebUI 只读展示，严禁放入凭证类字段）
 RUNTIME_STATE = {
@@ -366,40 +374,25 @@ def send_read_request(session):
         return None
 
 
-def main():
-    refresh_print = setup_logging()
-
-    session = create_session()
-    refresh_cookie(session)
-
-    # 每次运行从阅读页获取动态会话（psvts/token）与完整章节列表
-    session_info = fetch_reader_session(session, DEFAULT_BOOK_ID)
-    if not session_info:
-        logging.error("无法获取阅读页会话，终止运行。")
-        sys.exit(1)
-    book_id_num, psvts, token, reader_chapters = session_info
-    # 优先用阅读页章节（c/ci/sm 完全匹配），否则动态抓取，最后回退
-    chapters = reader_chapters or (fetch_chapters(session, DEFAULT_BOOK_ID) or FALLBACK_CHAPTERS)
+def read_one_book(session, book_id, count):
+    """对一本书阅读 count 次（成功计入），返回成功次数。失败超限提前结束。"""
+    # 获取该书阅读页会话与章节列表
+    si = fetch_reader_session(session, book_id)
+    if not si:
+        logging.error("无法获取《%s》阅读页会话，跳过。", book_id)
+        return 0
+    book_id_num, psvts, token, reader_chapters = si
+    session_info = si
+    chapters = reader_chapters or (fetch_chapters(session, book_id) or FALLBACK_CHAPTERS)
+    logging.info("《%s》开始阅读 %d 次。", book_id, count)
 
     index = 1
     fail_count = 0
     last_time = int(time.time()) - 30
-    RUNTIME_STATE.update({
-        "status": "reading",
-        "read_num": READ_NUM,
-        "index": 1,
-        "success_count": 0,
-        "fail_count": 0,
-        "last_result": "",
-        "started_at": _now_str(),
-        "finished_at": "",
-    })
-    logging.info("一共需要阅读 %d 次。", READ_NUM)
-
-    while index <= READ_NUM:
+    while index <= count:
         # 定期重新获取阅读页会话，避免 psvts 过期导致签名失败
         if index > 1 and (index - 1) % SESSION_REFRESH_EVERY == 0:
-            refreshed = fetch_reader_session(session, DEFAULT_BOOK_ID)
+            refreshed = fetch_reader_session(session, book_id)
             if refreshed:
                 session_info = refreshed
                 logging.info("已刷新阅读页会话（第 %d 次）。", index)
@@ -408,57 +401,79 @@ def main():
 
         this_time = build_data(last_time, chapters, session_info)
 
-        refresh_print(f"阅读进度: 第 {index}/{READ_NUM} 次，已完成 {(index - 1) * 0.5:.1f} 分钟")
+        refresh_print(f"阅读进度: 第 {index}/{count} 次，已完成 {(index - 1) * 0.5:.1f} 分钟")
         res_data = send_read_request(session)
 
         if res_data is None:
-            # 网络异常或非 JSON 响应，计入失败次数
             fail_count += 1
-            RUNTIME_STATE["last_result"] = "请求失败（网络/解析异常）"
         elif res_data.get('succ'):
             if 'synckey' in res_data:
                 fail_count = 0
                 last_time = this_time
                 index += 1
-                RUNTIME_STATE["success_count"] += 1
-                RUNTIME_STATE["last_result"] = "成功，synckey 已返回"
                 time.sleep(random.randint(*SLEEP_RANGE))
-                refresh_print(
-                    f"阅读进度: 第 {min(index, READ_NUM + 1) - 1}/{READ_NUM} 次，"
-                    f"已完成 {(index - 1) * 0.5:.1f} 分钟"
-                )
                 continue
             logging.warning("无 synckey，尝试修复...")
             fix_no_synckey(session)
             fail_count += 1
-            RUNTIME_STATE["last_result"] = "无 synckey，已尝试修复"
         else:
             logging.warning("read 返回失败，尝试刷新会话与 cookie...")
-            # psvts/token 过期是主要失败原因，先重新获取阅读页会话
-            refreshed = fetch_reader_session(session, DEFAULT_BOOK_ID)
+            refreshed = fetch_reader_session(session, book_id)
             if refreshed:
                 session_info = refreshed
                 logging.info("阅读页会话已刷新。")
             refresh_cookie(session)
             fail_count += 1
-            RUNTIME_STATE["last_result"] = "会话过期，已刷新重试"
-
-        RUNTIME_STATE["index"] = index
-        RUNTIME_STATE["fail_count"] = fail_count
 
         if fail_count >= MAX_FAIL_COUNT:
-            error_msg = f"连续失败 {fail_count} 次，终止运行。"
-            RUNTIME_STATE["status"] = "error"
-            RUNTIME_STATE["last_result"] = error_msg
-            logging.error(error_msg)
-            push(error_msg, is_success=False)
-            sys.exit(1)
+            logging.error("《%s》连续失败 %d 次，提前结束。", book_id, fail_count)
+            break
         time.sleep(random.randint(5, 10))
+
+    success = index - 1
+    logging.info("《%s》阅读结束，成功 %d 次。", book_id, success)
+    return success
+
+
+def random_book_ids(n):
+    """从书库随机挑 n 本有章节的书，返回 bookId 列表"""
+    try:
+        import library
+        all_ids = library.list_book_ids()
+        candidates = [
+            bid for bid in all_ids
+            if (library.load_book(bid) or {}).get("chapters")
+        ]
+    except Exception as exc:
+        logging.warning("读取书库失败：%s", sanitize(exc))
+        return []
+    if not candidates:
+        return []
+    picked = random.sample(candidates, min(n, len(candidates)))
+    logging.info("随机挑 %d 本书：%s", len(picked), ", ".join(picked))
+    return picked
+
+
+def main():
+    global refresh_print
+    refresh_print = setup_logging()
+
+    session = create_session()
+    refresh_cookie(session)
+
+    total_success = 0
+    # 1. 主书（默认三体）
+    total_success += read_one_book(session, DEFAULT_BOOK_ID, READ_NUM)
+
+    # 2. 主书读完后，随机挑书各读少量，确保新书有记录
+    if RANDOM_BOOKS > 0:
+        for book_id in random_book_ids(RANDOM_BOOKS):
+            total_success += read_one_book(session, book_id, RANDOM_BOOK_READS)
 
     RUNTIME_STATE["status"] = "done"
     RUNTIME_STATE["finished_at"] = _now_str()
-    logging.info("阅读脚本已完成。")
-    push(f"微信读书自动阅读完成。\n阅读时长：{READ_NUM * 0.5:.1f} 分钟。", is_success=True)
+    logging.info("阅读脚本已完成，共成功 %d 次。", total_success)
+    push(f"微信读书自动阅读完成。\n阅读时长：{total_success * 0.5:.1f} 分钟。", is_success=True)
 
 
 if __name__ == "__main__":

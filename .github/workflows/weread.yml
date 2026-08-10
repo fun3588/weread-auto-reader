@@ -31,6 +31,14 @@ jobs:
       - name: 安装依赖
         run: pip install -r requirements.txt
 
+      # 采集榜单书库（供随机书阅读使用；失败不影响主书阅读）
+      - name: 采集榜单书库
+        env:
+          WXREAD_CURL_BASH: ${{ secrets.WXREAD_CURL_BASH }}
+          HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
+        run: |
+          python v2/collector.py --ranks rising,all,hot_search,newbook --top 5 --chapters || echo "采集失败（跳过随机书）"
+
       # 主账号必填，备用账号可选：配置了 WXREAD_CURL_BASH_BACKUP 则两个账号并行，否则仅主账号
       - name: 运行阅读脚本
         env:
@@ -41,6 +49,8 @@ jobs:
           SERVERCHAN_SPT: ${{ secrets.SERVERCHAN_SPT }}
           READ_NUM: ${{ vars.READ_NUM || 18 }}
           BOOK_ID: ${{ vars.BOOK_ID || 'ce032b305a9bc1ce0b0dd2a' }}
+          RANDOM_BOOKS: ${{ vars.RANDOM_BOOKS || 10 }}
+          RANDOM_BOOK_READS: ${{ vars.RANDOM_BOOK_READS || 3 }}
         run: |
           set -e
           pids=""
