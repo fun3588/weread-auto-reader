@@ -46,11 +46,14 @@ COOKIE_DATA_VARIANTS = [
     {"rq": "%2Fweb%2Fbook%2Fread"},
 ]
 
-REQUEST_TIMEOUT = 15   # 单次请求超时（秒）
+REQUEST_TIMEOUT = 30   # 单次请求超时（秒），GitHub 网络较慢时留足余量
 MAX_FAIL_COUNT = 5     # 连续失败上限，超过则终止
 SLEEP_RANGE = (30, 35)  # 每次成功阅读后的随机等待区间（秒），保持 30 秒起的真人节奏
 CO_RANGE = (300, 700)   # 阅读页码随机范围，模拟真人翻页
 SESSION_REFRESH_EVERY = 6  # 每成功 N 次重新获取阅读页会话（psvts 有效期约几分钟）
+
+# 代理不可达时置为 True，后续所有请求自动改直连
+_PROXY_FAILED = False
 
 # 运行状态（供本地 WebUI 只读展示，严禁放入凭证类字段）
 RUNTIME_STATE = {
@@ -95,20 +98,34 @@ def cal_hash(input_string):
 
 def create_session():
     """创建带鉴权信息的会话，后续响应的 Set-Cookie 会自动更新会话凭证"""
+    global _PROXY_FAILED
     session = requests.Session()
+    # 关闭环境代理自动接管，仅使用显式配置的 HTTP_PROXY，避免 GitHub 内部代理干扰
+    session.trust_env = False
     session.headers.update(headers)
     session.cookies.update(cookies)
-    if HTTP_PROXY:
-        session.proxies.update({"http": HTTP_PROXY, "https": HTTP_PROXY})
+    # 代理先前不可达则直接直连
+    if HTTP_PROXY and not _PROXY_FAILED:
+        proxy = HTTP_PROXY.strip()
+        # 代理值含空格/控制字符时视为无效，回退直连
+        if " " in proxy or "\n" in proxy or "\r" in proxy:
+            logging.warning("HTTP_PROXY 含非法字符（空格/换行），已忽略并改用直连。")
+            proxy = ""
+        if proxy and not proxy.startswith(("http://", "https://", "socks")):
+            logging.warning("HTTP_PROXY 格式无效：%s，已忽略并改用直连。", proxy)
+            proxy = ""
+        if proxy:
+            session.proxies.update({"http": proxy, "https": proxy})
     return session
 
 
 def get_wr_skey(session):
-    """刷新 cookie 密钥，成功返回新的 wr_skey，否则返回 None"""
+    """刷新 cookie 密钥，成功返回新的 wr_skey，否则返回 None。
+    _session_request 已内置代理不可达时自动直连回退。"""
     for cookie_data in COOKIE_DATA_VARIANTS:
         try:
-            response = session.post(
-                RENEW_URL,
+            response = _session_request(
+                session, "POST", RENEW_URL,
                 data=json.dumps(cookie_data, separators=(',', ':')),
                 timeout=REQUEST_TIMEOUT,
             )
@@ -141,11 +158,35 @@ def refresh_cookie(session):
         raise SystemExit(error_msg)
 
 
+def _session_request(session, method, url, **kwargs):
+    """带代理回退的请求：代理不可达时自动改直连重试一次。
+    返回响应对象；代理整体不可用时置 _PROXY_FAILED 并直连。"""
+    global _PROXY_FAILED
+    if _PROXY_FAILED and session.proxies:
+        # 已知代理不可达，直接清空改直连
+        session.proxies = {}
+    try:
+        return session.request(method, url, **kwargs)
+    except requests.RequestException:
+        if session.proxies and not _PROXY_FAILED:
+            _PROXY_FAILED = True
+            logging.warning("代理不可达，后续自动改用直连。")
+            saved = session.proxies
+            session.proxies = {}
+            try:
+                return session.request(method, url, **kwargs)
+            except requests.RequestException:
+                pass
+            finally:
+                session.proxies = saved
+        raise
+
+
 def fix_no_synckey(session):
     """响应缺失 synckey 时，通过 chapterInfos 接口尝试修复"""
     try:
-        response = session.post(
-            "https://weread.qq.com/web/book/chapterInfos",
+        response = _session_request(
+            session, "POST", "https://weread.qq.com/web/book/chapterInfos",
             data=json.dumps({"bookIds": [DEFAULT_BOOK_ID]}, separators=(',', ':')),
             timeout=REQUEST_TIMEOUT,
         )
@@ -218,7 +259,9 @@ def fetch_reader_session(session, url_book_id):
     返回 (book_id_num, psvts, token, chapters)，失败返回 None。
     chapters: 每项含 chapterUid/chapterIdx/title，用于构造 c/ci/sm 完全匹配的请求。"""
     try:
-        response = session.get(f"{READER_URL}/{url_book_id}", timeout=REQUEST_TIMEOUT)
+        response = _session_request(
+            session, "GET", f"{READER_URL}/{url_book_id}", timeout=REQUEST_TIMEOUT
+        )
         state = extract_state(response.text)
     except requests.RequestException as exc:
         logging.warning("阅读页 %s 请求失败：%s", url_book_id, sanitize(exc))
@@ -253,8 +296,8 @@ def fetch_reader_session(session, url_book_id):
 def fetch_chapters(session, book_id):
     """每次运行抓取一次书籍的真实章节列表，失败或解析为空时返回 None"""
     try:
-        response = session.post(
-            "https://weread.qq.com/web/book/chapterInfos",
+        response = _session_request(
+            session, "POST", "https://weread.qq.com/web/book/chapterInfos",
             data=json.dumps({"bookIds": [book_id]}, separators=(',', ':')),
             timeout=REQUEST_TIMEOUT,
         )
@@ -309,8 +352,8 @@ def build_data(last_time, chapters, session_info):
 def send_read_request(session):
     """发送一次阅读请求，返回解析后的响应 dict，网络/解析异常返回 None"""
     try:
-        response = session.post(
-            READ_URL,
+        response = _session_request(
+            session, "POST", READ_URL,
             data=json.dumps(data, separators=(',', ':')),
             timeout=REQUEST_TIMEOUT,
         )
